@@ -3,6 +3,7 @@ hambox: Delving into Online High-quality Anchors Mining for Detecting Outer Face
 
 
 done:
+
 1 online high quality achor mining 
   a little different from the paper,assume there is an outer face ,compansented anchor and anchor matched in the fisrt step should be top K in candidates,
   the sort algorithm may be difficult，so after calculte iou outerface and decoded regression,erase M anchors which match in the first step,the sort the left 
