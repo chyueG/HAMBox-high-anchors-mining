@@ -5,7 +5,7 @@ from layers.bbox_utils import *
 
 class HAMLoss(nn.Module):
     def __init__(self,num_cls,variance, use_gpu = True):
-        super(MultiBoxLoss_v2, self).__init__()
+        super(HAMLoss, self).__init__()
         self.use_gpu = use_gpu
         self.num_classes = num_cls
         self.variance = variance
