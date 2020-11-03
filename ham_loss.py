@@ -1,6 +1,7 @@
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from layers.bbox_utils import *
+from utils.box_utils import *
 
 
 class HAMLoss(nn.Module):
@@ -14,7 +15,7 @@ class HAMLoss(nn.Module):
         self.K = 5
         self.T1 = 0.35
         self.T2 = 0.5
-        self.alpha = 0.5
+        self.alpha = 0.25
         self.gamma = 2
         self.smoothl1loss = SmoothL1Loss()
 
@@ -34,6 +35,7 @@ class HAMLoss(nn.Module):
         # priors = priors
         batch_size = loc_data.size(0)
         prior_size = priors.size(0)
+        defaults = priors.data
 
         loc_t = conf_data.new(batch_size,prior_size,4).float()
         conf_t = conf_data.new(batch_size,prior_size).float()
@@ -42,12 +44,12 @@ class HAMLoss(nn.Module):
         cc_score_t = conf_data.new(batch_size,prior_size).float()
 
         for idx in range(batch_size):
-            truths = targets[idx][:, :-1].data.float()
+            truths = targets[idx][:, :4].data.float()
             labels = targets[idx][:, -1].data.float()
             # conf   = conf_data[idx]
             loc_pred    = loc_data[idx]
            
-            iou = jaccard(truths, point_form(priors))  ###### gt_boxes.size()[0]*anchors.size()[0]
+            iou = jaccard(truths, point_form(defaults))  ###### gt_boxes.size()[0]*anchors.size()[0]
 
             best_truth_score, best_truth_idx = iou.max(0, keepdim=True)
 
@@ -68,11 +70,11 @@ class HAMLoss(nn.Module):
             conf_s1 = labels[best_truth_idx]  # face label is 1
             conf_s1[best_truth_score<self.T1] = 0
 
-            loc_s1 = encode(matches_s1,priors,self.variance)
+            loc_s1 = encode(matches_s1,defaults,self.variance)
 
 
 
-            decoded_regress = decode(loc_pred, priors, self.variance)
+            decoded_regress = decode(loc_pred, defaults, self.variance)
             c_iou = jaccard(truths, decoded_regress)
             c_best_prior_score ,c_best_prior_idx = c_iou.max(0,keepdim=True)
             c_best_prior_score.squeeze_(0)
@@ -90,7 +92,7 @@ class HAMLoss(nn.Module):
 
 
             matches_s2 = truths[c_best_prior_idx]
-            loc_s2 = encode(matches_s2,priors,self.variance)
+            loc_s2 = encode(matches_s2,defaults,self.variance)
             conf_s2 = labels[c_best_prior_idx]
             conf_s2[c_prior_score.lt(self.T2)] = -1
             ignore_idx = best_truth_score.lt(self.T1)*(~c_best_prior_score.lt(self.T2))*c_prior_score.lt(self.T2)
@@ -102,17 +104,22 @@ class HAMLoss(nn.Module):
             cloc_t[idx] = loc_s2
             cc_score_t[idx] = c_prior_score
 
-
-        loc_loss = self.smoothl1loss(loc_data[conf_t>0],loc_t[conf_t>0]) + self.smoothl1loss(loc_data[cconf_t>0],cloc_t[cconf_t>0])
-        loss_cls_s1 = focal_loss(conf_data, conf_t, self.alpha, self.gamma, None)
-        #loss_cls_s1 = torch.where(conf_t.ne(-1),cls_loss_s1,torch.tensor(0.).cuda())
-        #loss_cls_s1 = loss_cls_s1.sum() / (conf_t.gt(0).sum())
-        loss_cls_s2 = focal_loss(conf_data, cconf_t, self.alpha, self.gamma, cc_score_t)
-        #loss_cls_s2 = torch.where(conf_t.ne(-1),cls_loss_s2,torch.tensor(0.).cuda())
-        #loss_cls_s2 = loss_cls_s2.sum() / (cconf_t.gt(0).sum())
-        cls_loss =  loss_cls_s1 + loss_cls_s2
-
-        return loc_loss,cls_loss
+        if conf_t.gt(0).sum()>0 and cconf_t.gt(0).sum()<1 :
+            loc_loss = self.smoothl1loss(loc_data[conf_t>0],loc_t[conf_t>0])
+            loss_cls_s1 = focal_loss(conf_data, conf_t, self.alpha, self.gamma, None)
+            return loc_loss,loss_cls_s1
+        elif conf_t.gt(0).sum()>0 and cconf_t.gt(0).sum()>0:
+            loc_loss = self.smoothl1loss(loc_data[conf_t > 0], loc_t[conf_t > 0]) + self.smoothl1loss(loc_data[cconf_t > 0], cloc_t[cconf_t > 0])
+            loss_cls_s1 = focal_loss(conf_data, conf_t, self.alpha, self.gamma, None)
+            loss_cls_s2 = focal_loss(conf_data, cconf_t, self.alpha, self.gamma, cc_score_t)
+            cls_loss =  loss_cls_s1 + loss_cls_s2
+            return loc_loss,cls_loss
+        elif conf_t.gt(0).sum()<1 and cconf_t.gt(0).sum()>0:
+            loc_loss = self.smoothl1loss(loc_data[cconf_t > 0], cloc_t[cconf_t > 0])
+            loss_cls_s2 = focal_loss(conf_data, cconf_t, self.alpha, self.gamma, cc_score_t)
+            return loc_loss, loss_cls_s2
+        else:
+            return torch.tensor(1e-4).cuda(),torch.tensor(1e-4).cuda()
 
 
 
@@ -164,6 +171,8 @@ class SmoothL1Loss(nn.Module):
         l1 = x - 0.5*self.beta
         l2 = 0.5*x**2/self.beta
         return torch.sum(torch.where(x>=self.beta,l1,l2))/pred.size(0)
+
+
 
 
 
