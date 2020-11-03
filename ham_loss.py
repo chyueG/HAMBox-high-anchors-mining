@@ -136,7 +136,7 @@ def focal_loss(prob,target,alpha,gamma,f_iou=None):
 
     ce = F.binary_cross_entropy_with_logits(prob, target, reduction="none")
     alpha = target*alpha + (1.-target)*(1- alpha)
-    pt = torch.where(target==1,prob,1-prob)
+    pt = torch.where(target==1,torch.sigmoid(prob),1-torch.sigmoid(prob))
     if f_iou is not None:
         with torch.no_grad():
             f_iou = f_iou.view(-1,1)
