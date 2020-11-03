@@ -1,20 +1,20 @@
-import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from layers.bbox_utils import *
 
+
 class HAMLoss(nn.Module):
-    def __init__(self,num_cls,variance, use_gpu = True):
+    def __init__(self, use_gpu = True):
         super(HAMLoss, self).__init__()
         self.use_gpu = use_gpu
-        self.num_classes = num_cls
-        self.variance = variance
+        # self.num_classes = num_cls
+        # self.variance = variance
 
-        #self.variance = [0.1, 0.2]
+        self.variance = [0.1, 0.2]
         self.K = 5
         self.T1 = 0.35
         self.T2 = 0.5
-        self.alpha = 0.25
+        self.alpha = 0.5
         self.gamma = 2
         self.smoothl1loss = SmoothL1Loss()
 
@@ -30,141 +30,117 @@ class HAMLoss(nn.Module):
             ground_truth (tensor): Ground truth boxes and labels for a batch,
                 shape: [batch_size,num_objs,5] (last idx is the label).
         """
-        loss_cls,loss_loc = list(),list()
         loc_data, conf_data, priors = predictions
-        priors = priors
-        num = loc_data.size(0)
+        # priors = priors
+        batch_size = loc_data.size(0)
+        prior_size = priors.size(0)
 
-        for idx in range(num):
-            truths = targets[idx][:, :-1].data
-            labels = targets[idx][:, -1].data
-            defaults = priors
-            conf     = conf_data[idx]
-            loc       = loc_data[idx]
+        loc_t = conf_data.new(batch_size,prior_size,4).float()
+        conf_t = conf_data.new(batch_size,prior_size).float()
+        cloc_t = conf_data.new(batch_size,prior_size,4).float()
+        cconf_t = conf_data.new(batch_size,prior_size).float()
+        cc_score_t = conf_data.new(batch_size,prior_size).float()
 
-            if truths.shape[0] == 0:
-                if torch.cuda.is_available():
-                    loss_cls.append(torch.tensor(0).float().cuda())
-                    loss_loc.append(torch.tensor(0).float().cuda())
-                else:
-                    loss_cls.append(torch.tensor(0).float())
-                    loss_loc.append(torch.tensor(0).float())
-
-                continue
-            iou = jaccard(truths, point_form(defaults))  ###### gt_boxes.size()[0]*anchors.size()[0]
+        for idx in range(batch_size):
+            truths = targets[idx][:, :-1].data.float()
+            labels = targets[idx][:, -1].data.float()
+            # conf   = conf_data[idx]
+            loc_pred    = loc_data[idx]
+           
+            iou = jaccard(truths, point_form(priors))  ###### gt_boxes.size()[0]*anchors.size()[0]
 
             best_truth_score, best_truth_idx = iou.max(0, keepdim=True)
+
             best_truth_score.squeeze_(0)
             best_truth_idx.squeeze_(0)
 
-            assign_annotation = truths[best_truth_idx]
+            for _ in range(iou.size(0)):
+                best_prior_score,best_prior_idx = iou.max(1,keepdim=True)
+                j = best_prior_score.max(0)[1][0]
+                i = best_prior_idx[j][0]
+                iou[j,:] = -1
+                iou[:,i] = -1
+                best_truth_score[i] = best_prior_score.max(0)[0][0]
+                best_truth_idx[i] = j
 
-            n_pos_idx = best_truth_score.gt(self.T1)
+            matches_s1 = truths[best_truth_idx]
 
-            match_labels = labels[best_truth_idx]
-            n_encoded_loc = encode(assign_annotation,priors,self.variance)
+            conf_s1 = labels[best_truth_idx]  # face label is 1
+            conf_s1[best_truth_score<self.T1] = 0
 
-            m_anchor_cnt = torch.bincount(best_truth_idx[n_pos_idx])  ######r
-            match_anchor_cnt = torch.zeros_like(labels)
-            match_anchor_cnt[:m_anchor_cnt.size(0)] = m_anchor_cnt
-            normal_targets = -1*torch.ones_like(conf).cuda()
-            normal_targets[n_pos_idx,:] = 0
-            normal_targets[n_pos_idx,match_labels[n_pos_idx].long()] = 1
-            decoded_regress = decode(loc, defaults, self.variance)
+            loc_s1 = encode(matches_s1,priors,self.variance)
 
+
+
+            decoded_regress = decode(loc_pred, priors, self.variance)
             c_iou = jaccard(truths, decoded_regress)
+            c_best_prior_score ,c_best_prior_idx = c_iou.max(0,keepdim=True)
+            c_best_prior_score.squeeze_(0)
+            c_best_prior_idx.squeeze_(0)
+            c_iou = c_iou*(~c_iou.lt(self.T2))#####keep overlap greater than T2
+            c_prior_score = -1 * torch.zeros_like(c_best_prior_score)
+            #with torch.no_grad():
+            ctopk_prior_score,ctopk_prior_idx = torch.topk(c_iou,self.K,dim=1)
+            #c_prior_idx = -1*torch.ones_like(best_truth_score)
+            for i in range(c_iou.size(0)):
+                 for j in range(self.K):
+                     if conf_s1[ctopk_prior_idx[i,j]].lt(1) and ctopk_prior_score[i,j].gt(0):
+                         c_best_prior_idx[ctopk_prior_idx[i,j]] = i
+                         c_prior_score[ctopk_prior_idx[i,j]] = ctopk_prior_score[i,j]
 
-            if torch.isnan(c_iou).any():
-                print("check decoded_regress")
 
-            c_best_truth_score, c_best_truth_idx = c_iou.max(0, keepdim=True)
-            c_best_truth_score.squeeze_(0)
-            c_best_truth_idx.squeeze_(0)
+            matches_s2 = truths[c_best_prior_idx]
+            loc_s2 = encode(matches_s2,priors,self.variance)
+            conf_s2 = labels[c_best_prior_idx]
+            conf_s2[c_prior_score.lt(self.T2)] = -1
+            ignore_idx = best_truth_score.lt(self.T1)*(~c_best_prior_score.lt(self.T2))*c_prior_score.lt(self.T2)
+            conf_s1[ignore_idx] = -1
 
-            ignore_idx = torch.bitwise_and(c_best_truth_score.gt(self.T2), best_truth_score.lt(self.T1))
-            neg_idx    =  ~torch.bitwise_or(n_pos_idx,ignore_idx)
-            normal_targets[neg_idx,:] = 0
-            #normal_targets[neg_idx,0] = 1
+            conf_t[idx] = conf_s1
+            cconf_t[idx] = conf_s2
+            loc_t[idx] = loc_s1
+            cloc_t[idx] = loc_s2
+            cc_score_t[idx] = c_prior_score
 
-            if n_pos_idx.sum() > 0:
-                loss_cls_normal = focal_loss(normal_targets, conf, self.alpha, self.gamma, None)
-                loss_cls_normal = torch.where(normal_targets.ne(-1),loss_cls_normal,torch.tensor(0.).float().cuda())
-                loss_cls_normal = loss_cls_normal.sum() / n_pos_idx.sum()
-                loc_normal = loc[n_pos_idx]
-                assign_loc = n_encoded_loc[n_pos_idx]
-                loss_loc_normal = self.smoothl1loss(loc_normal, assign_loc)
 
-            else:
-                loss_cls_normal = torch.tensor(0.).cuda()
-                loss_loc_normal = torch.tensor(0.).cuda()
+        loc_loss = self.smoothl1loss(loc_data[conf_t>0],loc_t[conf_t>0]) + self.smoothl1loss(loc_data[cconf_t>0],cloc_t[cconf_t>0])
+        loss_cls_s1 = focal_loss(conf_data, conf_t, self.alpha, self.gamma, None)
+        #loss_cls_s1 = torch.where(conf_t.ne(-1),cls_loss_s1,torch.tensor(0.).cuda())
+        #loss_cls_s1 = loss_cls_s1.sum() / (conf_t.gt(0).sum())
+        loss_cls_s2 = focal_loss(conf_data, cconf_t, self.alpha, self.gamma, cc_score_t)
+        #loss_cls_s2 = torch.where(conf_t.ne(-1),cls_loss_s2,torch.tensor(0.).cuda())
+        #loss_cls_s2 = loss_cls_s2.sum() / (cconf_t.gt(0).sum())
+        cls_loss =  loss_cls_s1 + loss_cls_s2
 
-            outface_idx_mask = match_anchor_cnt.lt(self.K)
-            loss_cls_com = torch.tensor(0.).cuda()
-            loss_loc_com = torch.tensor(0.).cuda()
-
-            if outface_idx_mask.any():
-                outface_idx     = torch.arange(0,truths.size(0))[outface_idx_mask]
-                c_anchor_num = (self.K - match_anchor_cnt)[outface_idx_mask]
-                ####### mask outerface already match anchors in first step
-
-                for _,value in enumerate(outface_idx):
-                     c_mask_idx = torch.bitwise_and(best_truth_idx.eq(value),best_truth_score.gt(self.T1))
-                     c_mask_idx = torch.arange(0,defaults.size(0))[c_mask_idx]
-                     c_iou[value.long()].index_fill_(0,c_mask_idx,torch.tensor(0.).cuda())
-
-                outface_iou = c_iou[outface_idx_mask]
-                c_best_truth_score, c_best_truth_idx = outface_iou.max(0, keepdim=True)
-                c_best_truth_idx.squeeze_(0)
-                c_best_truth_score.squeeze_(0)
-
-                c_match_nums = torch.zeros(c_anchor_num.shape)
-                c_match_nums = c_match_nums.type_as(c_best_truth_idx)
-
-                c_match_nums = c_match_nums.scatter(0,torch.arange(len(torch.bincount(c_best_truth_idx[c_best_truth_score.gt(self.T2)]))),\
-                                     torch.bincount(c_best_truth_idx[c_best_truth_score.gt(self.T2)]))
-                c_anchor_num = torch.where(c_match_nums.lt(c_anchor_num.long()),c_match_nums,c_anchor_num.long())
-
-                if c_anchor_num.sum().gt(0):
-                    com_targets = -1 * torch.ones_like(conf).cuda()
-                    c_iou_score, c_iou_idx = outface_iou.sort(dim=1, descending=True)
-                    com_iou = torch.zeros_like(best_truth_idx).float().cuda()
-                    com_pos_idx = torch.zeros_like(best_truth_idx).cuda()
-                    for outer_idx, value in enumerate(outface_idx):
-                        if c_anchor_num[outer_idx].gt(0):
-                            com_pos_idx.index_fill_(0,c_iou_idx[outer_idx,:c_anchor_num[outer_idx].long()],torch.tensor(1).cuda())
-                            c_best_truth_idx.index_fill_(0,c_iou_idx[outer_idx,:c_anchor_num[outer_idx].long()],value)
-                            com_iou[c_iou_idx[outer_idx,:c_anchor_num[outer_idx].long()]] = c_iou_score[outer_idx,:c_anchor_num[outer_idx].long()]
-
-                            # com_targets.index_put_(c_anchor_box_axis, labels[i])
-                            com_targets[c_iou_idx[outer_idx,:c_anchor_num[outer_idx].long()], :] = 0
-                            com_targets[c_iou_idx[outer_idx,:c_anchor_num[outer_idx].long()], labels[value].long()] = labels[value].half()
-                        else:
-                            continue
-                    com_pos_idx = com_pos_idx.bool()
-                    c_encoded_loc = encode(truths[c_best_truth_idx], priors, self.variance)
-                    c_assign_annotations = c_encoded_loc[com_pos_idx]
-                    loc_c = loc[com_pos_idx]
-                    loss_loc_com = self.smoothl1loss(loc_c,c_assign_annotations)
-                    loss_cls_com = focal_loss(com_targets, conf, self.alpha, self.gamma, com_iou)
-                    loss_cls_com = torch.where(com_targets.ne(-1),loss_cls_com,torch.tensor(0.).cuda())
-                    loss_cls_com = loss_cls_com.sum() / c_anchor_num.sum()
-
-            loss_cls.append(loss_cls_normal+loss_cls_com)
-            loss_loc.append(loss_loc_normal+loss_loc_com)
-
-        return torch.stack(loss_loc).mean(dim=0), torch.stack(loss_cls).mean(dim=0)
+        return loc_loss,cls_loss
 
 
 
-def focal_loss(target,prob,alpha,gamma,f_iou=None):
+def focal_loss(prob,target,alpha,gamma,f_iou=None):
+
+    num_classes = prob.size(-1)
+    target      = target.view(-1,1)
+    keep = (target >= 0).float()
+    target[target < 0] = 0  #
+    pos_anchor_nums = target.gt(0).sum()
+
+    prob        = prob.view(-1,num_classes)
+    prob        = prob.gather(1,target.long())
 
     ce = F.binary_cross_entropy_with_logits(prob, target, reduction="none")
     alpha = target*alpha + (1.-target)*(1- alpha)
     pt = torch.where(target==1,prob,1-prob)
     if f_iou is not None:
-        alpha = f_iou.unsqueeze(dim=1)*alpha
+        with torch.no_grad():
+            f_iou = f_iou.view(-1,1)
 
-    return  alpha*(1.-pt)**gamma*ce
+            alpha = f_iou*alpha
+
+    loss = alpha*(1.-pt)**gamma*ce
+    loss = loss*keep
+    loss = loss.sum()/pos_anchor_nums
+    return loss
+
 
 def log_sum_exp(x):
     """Utility function for computing log_sum_exp while determining
@@ -183,11 +159,11 @@ class SmoothL1Loss(nn.Module):
         self.beta = 0.11
 
     def forward(self,pred,target):
+
         x = (pred - target).abs()
         l1 = x - 0.5*self.beta
         l2 = 0.5*x**2/self.beta
         return torch.sum(torch.where(x>=self.beta,l1,l2))/pred.size(0)
-
 
 
 
