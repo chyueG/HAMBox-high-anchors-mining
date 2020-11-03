@@ -23,4 +23,7 @@ todo
 
 
 change date 1103
+
 many useless code and some error，the compensated anchor score should with no grad， refer to c_iou
+
+base project https://github.com/biubug6/Pytorch_Retinaface/   just use hamloss insteat of multiboxloss
