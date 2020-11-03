@@ -2,7 +2,7 @@
 hambox: Delving into Online High-quality Anchors Mining for Detecting Outer Faces
 
 
-done:
+done :
 
 1 online high quality achor mining 
   a little different from the paper,assume there is an outer face ,compansented anchor and anchor matched in the fisrt step should be top K in candidates,
@@ -20,3 +20,7 @@ todo
 1 paper refers use p2-p6 five layers,anchor size is 0.68*[16,32,64,128,256,512], re-implement anchor size dont take ratio 0.68 into account
 
 2 train loss is convergence , but during training ,dead lock always appears,the training code is under going
+
+
+change date 1103
+many useless code and some error，the compensated anchor score should with no grad， refer to c_iou
