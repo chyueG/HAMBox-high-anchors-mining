@@ -74,7 +74,7 @@ class HAMLoss(nn.Module):
 
 
 
-            decoded_regress = decode(loc_pred, defaults, self.variance)
+            decoded_regress = decode(loc_pred.detach(), defaults, self.variance)
             c_iou = jaccard(truths, decoded_regress)
             c_best_prior_score ,c_best_prior_idx = c_iou.max(0,keepdim=True)
             c_best_prior_score.squeeze_(0)
